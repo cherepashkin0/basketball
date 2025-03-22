@@ -4,25 +4,47 @@ import pandas as pd
 from clickhouse_connect import get_client
 
 # Set the desired chunk size (number of rows per insert)
-CHUNK_SIZE = 10000
+CHUNK_SIZE = 50000
+# Number of rows to use for type inference
+SAMPLE_ROWS = 10000
 
-def map_dtype_to_clickhouse(pd_dtype):
+dict_always_str = {'game_time': str, 'live_pc_time': str, 'natl_tv_broadcaster_abbreviation': str, 'wctimestring': str,
+                    'wl_home': str, 'wl_away': str}
+
+def infer_clickhouse_type(series, threshold=0.1):
     """
-    Map a pandas dtype to an appropriate ClickHouse type.
+    Infer the ClickHouse type for a pandas Series.
+    
+    - Attempt to convert the series to numeric.
+    - If more than 'threshold' fraction of non-null values fail conversion,
+      then treat the column as a String.
+    - Otherwise, use the native numeric type.
+    - Wrap the type in Nullable() if any null values are present.
     """
-    if pd_dtype.name == 'object':
-        return 'String'
-    elif 'int' in pd_dtype.name:
-        return 'Int64'
-    elif 'float' in pd_dtype.name:
-        return 'Float64'
-    elif pd_dtype.name == 'bool':
-        # ClickHouse does not have a native boolean, so use UInt8 (0 or 1)
-        return 'UInt8'
-    elif 'datetime' in pd_dtype.name:
-        return 'DateTime'
+    if series.name in dict_always_str:
+        return "Nullable(String)"
+    non_null_count = series.notnull().sum()
+    numeric_series = pd.to_numeric(series, errors='coerce')
+    conversion_failures = ((series.notnull()) & (numeric_series.isnull())).sum()
+    
+    if non_null_count > 0 and (conversion_failures / non_null_count) > threshold:
+        inferred = 'String'
     else:
-        return 'String'
+        if pd.api.types.is_integer_dtype(series):
+            inferred = 'Int64'
+        elif pd.api.types.is_float_dtype(series):
+            inferred = 'Float64'
+        elif pd.api.types.is_bool_dtype(series):
+            inferred = 'UInt8'
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            inferred = 'DateTime'
+        else:
+            inferred = 'String'
+    
+    if series.isnull().any():
+        return f"Nullable({inferred})"
+    else:
+        return inferred
 
 def process_csv_file(csv_file_path, client):
     """
@@ -35,11 +57,12 @@ def process_csv_file(csv_file_path, client):
     # Use the file name (without extension) as the table name.
     table_name = os.path.splitext(os.path.basename(csv_file_path))[0]
     
-    # Read a small sample from the CSV file to infer column names and dtypes.
-    sample_df = pd.read_csv(csv_file_path, nrows=100)
+    # Force game_time to be read as a string by specifying its dtype.
+    sample_df = pd.read_csv(csv_file_path, nrows=SAMPLE_ROWS, dtype=dict_always_str)
     columns = sample_df.columns.tolist()
-    dtypes = sample_df.dtypes
-    clickhouse_types = [map_dtype_to_clickhouse(dtype) for dtype in dtypes]
+    
+    # Infer ClickHouse types for each column using the sample.
+    clickhouse_types = [infer_clickhouse_type(sample_df[col]) for col in columns]
     
     # Drop the table if it already exists.
     client.command(f"DROP TABLE IF EXISTS {table_name}")
@@ -51,10 +74,11 @@ def process_csv_file(csv_file_path, client):
     client.command(create_table_query)
     print(f"Table '{table_name}' created with columns and types: {list(zip(columns, clickhouse_types))}")
     
-    # Insert the CSV data in chunks using pandas.
     total_rows = 0
-    for chunk in pd.read_csv(csv_file_path, chunksize=CHUNK_SIZE):
-        # Convert the DataFrame chunk into a list of lists.
+    # Process the CSV file in chunks, also forcing game_time to be a string.
+    for chunk in pd.read_csv(csv_file_path, chunksize=CHUNK_SIZE, dtype=dict_always_str):
+        # Replace NaN with None so that ClickHouse can handle missing values.
+        chunk = chunk.where(pd.notnull(chunk), None)
         data = chunk.values.tolist()
         client.insert(table=table_name, data=data, column_names=columns)
         total_rows += len(chunk)
@@ -78,7 +102,8 @@ def main():
     )
     
     # Directory containing CSV files.
-    csv_dir = "/home/wsievolod/projects/datasets/basketball/csv"
+    csv_dir = "/home/wsievolod/projects/datasets/basketball/csv/"
+    print(os.listdir(csv_dir))
     csv_files = glob.glob(os.path.join(csv_dir, "*.csv"))
     if not csv_files:
         print("No CSV files found in directory:", csv_dir)
