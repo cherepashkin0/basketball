@@ -28,28 +28,30 @@ def get_database_engine(database_env_var: str) -> create_engine:
     return engine
 
 
-def find_csv_files(directory: str, tables: set) -> list:
+def find_csv_files(directory: str, table_names: set) -> list:
     all_csv_files = glob.glob(os.path.join(directory, "*.csv"))
-    return [f for f in all_csv_files if os.path.splitext(os.path.basename(f))[0] in tables]
+    # splitext - splits content on root and ext, system independent
+    return [f for f in all_csv_files if os.path.splitext(os.path.basename(f))[0] in table_names] 
 
 
 def upload_csv_file(engine, file_path: str, chunk_size: int):
     table_name = os.path.splitext(os.path.basename(file_path))[0]
     print(f'Processing table: {table_name}')
 
-    chunk_iterator = pd.read_csv(file_path, chunksize=chunk_size)
+    chunk_iterator = pd.read_csv(file_path, chunksize=chunk_size) # Returns an iterator that yields DataFrames, each with up to chunk_size rows.
     for chunk in tqdm(chunk_iterator, desc=f"Uploading {table_name}", unit="chunk"):
+        # append is necessary for: creating new tables, if exist, upload new chunks to existing tables
         chunk.to_sql(table_name, con=engine, if_exists='append', index=False)
 
 
 def main(table_type: str, database_env_var: str):
-    tables_dict = load_tables_dict('tables_dict.json')
-    selected_tables = set(tables_dict[table_type])
+    tables_dict = load_tables_dict('tables_dict.json') # file with names of game-specific and player-specific tables
+    selected_table_names = set(tables_dict[table_type]) # set is for deduplication
 
     engine = get_database_engine(database_env_var)
 
     csv_directory = '/home/wsievolod/projects/datasets/basketball/csv/'
-    csv_files = find_csv_files(csv_directory, selected_tables)
+    csv_files = find_csv_files(csv_directory, selected_table_names)
 
     if not csv_files:
         print(f"No {table_type} CSV files found.")
@@ -57,7 +59,7 @@ def main(table_type: str, database_env_var: str):
 
     print(f"Found {len(csv_files)} {table_type} CSV files. Uploading...")
 
-    CHUNK_SIZE = 500000
+    CHUNK_SIZE = 500000 # number of rows to load in one chunk. 
 
     for file_path in tqdm(csv_files, desc=f"Uploading {table_type} files", unit="file"):
         upload_csv_file(engine, file_path, CHUNK_SIZE)

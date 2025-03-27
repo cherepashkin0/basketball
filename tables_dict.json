@@ -1,0 +1,22 @@
+{
+    "game_specific": [
+        "game",
+        "game_info",
+        "game_summary",
+        "inactive_players",
+        "line_score",
+        "officials",
+        "other_stats",
+        "play_by_play"
+    ],
+    "player_specific": [
+        "common_player_info",
+        "draft_combine_stats",
+        "draft_history",
+        "player",
+        "team",
+        "team_details",
+        "team_history",
+        "team_info_common"
+    ]
+}

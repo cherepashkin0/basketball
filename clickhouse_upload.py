@@ -3,6 +3,8 @@ import glob
 import json
 import pandas as pd
 from clickhouse_connect import get_client
+import argparse
+from tqdm import tqdm
 
 CHUNK_SIZE = 50000
 
@@ -55,6 +57,12 @@ type_mapping = {
     "datetime64[ns]": "DateTime"
 }
 
+def clear_database(client):
+    tables = client.command('SHOW TABLES').split('\n')
+    for table in tables:
+        if table:
+            client.command(f'DROP TABLE IF EXISTS {table}')
+
 def process_csv_file(csv_file_path, client):
     table_name = os.path.splitext(os.path.basename(csv_file_path))[0]
 
@@ -74,19 +82,20 @@ def process_csv_file(csv_file_path, client):
     create_table_query = f"CREATE TABLE {table_name} ({col_defs}) ENGINE = MergeTree() ORDER BY tuple()"
     client.command(create_table_query)
 
-    for chunk in pd.read_csv(csv_file_path, chunksize=CHUNK_SIZE, dtype=dict_always_str):
+    for chunk in tqdm(pd.read_csv(csv_file_path, chunksize=CHUNK_SIZE, dtype=dict_always_str), desc=f"Uploading {table_name}", unit="chunk"):
         chunk = chunk.where(pd.notnull(chunk), None)
         data = chunk.values.tolist()
         client.insert(table=table_name, data=data, column_names=columns)
 
-def main():
+def main(table_type: str, database_env_var: str, clear_db: bool):
     host = os.getenv("CLICKHOUSE_HOST")
     port = int(os.getenv("CLICKHOUSE_PORT", 8123))
     user = os.getenv("CLICKHOUSE_USER")
     password = os.getenv("CLICKHOUSE_PASSWORD")
-    database = os.getenv("DATABASE_GAME")
+    database = os.getenv(database_env_var)
 
-    if None in [host, user, password, database]:
+    required_vars = [host, user, password, database]
+    if None in required_vars:
         raise ValueError("Missing required ClickHouse environment variables.")
 
     client = get_client(
@@ -97,22 +106,30 @@ def main():
         database=database
     )
 
+    if clear_db:
+        clear_database(client)
+
     csv_dir = "/home/wsievolod/projects/datasets/basketball/csv/"
 
     with open('tables_dict.json', 'r') as f:
         tables_dict = json.load(f)
-    tables_to_upload = set(tables_dict['game_specific'])
+    tables_to_upload = set(tables_dict[table_type]) # set is for deduplication
 
     csv_files = glob.glob(os.path.join(csv_dir, "*.csv"))
     csv_files = [f for f in csv_files if os.path.splitext(os.path.basename(f))[0] in tables_to_upload]
 
     if not csv_files:
-        print("No player-specific CSV files found.")
+        print(f"No {table_type} CSV files found.")
         return
 
-    for csv_file in csv_files:
-        print(f"Processing player-specific file: {csv_file}")
+    for csv_file in tqdm(csv_files, desc=f"Processing {table_type} files", unit="file"):
         process_csv_file(csv_file, client)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Upload CSV files to ClickHouse")
+    parser.add_argument("--table_type", required=True, choices=['game_specific', 'player_specific'], help="Type of tables to upload")
+    parser.add_argument("--database_env_var", required=True, help="Environment variable name for the target database")
+    parser.add_argument("--clear_db", action="store_true", help="Clear database before uploading")
+    args = parser.parse_args()
+
+    main(args.table_type, args.database_env_var, args.clear_db)
