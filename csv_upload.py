@@ -26,14 +26,6 @@ dict_always_str = {
     'scoremargin': str
 }
 
-type_mapping = {
-    "string": "String",
-    "Int64": "Int64",
-    "Float64": "Float64",
-    "boolean": "UInt8",
-    "datetime64[ns]": "DateTime"
-}
-
 def load_tables_dict(filepath: str) -> dict:
     with open(filepath, 'r') as file:
         return json.load(file)
@@ -44,10 +36,11 @@ def find_csv_files(directory: str, table_names: set) -> list:
 
 def upload_csv_to_postgres(engine, file_path: str):
     table_name = os.path.splitext(os.path.basename(file_path))[0]
-    print(f'Processing table: {table_name}')
+    create_postgres_table(engine, file_path)
     chunk_iterator = pd.read_csv(file_path, chunksize=CHUNK_SIZE_POSTGRES)
     for chunk in tqdm(chunk_iterator, desc=f"Uploading {table_name}", unit="chunk"):
         chunk.to_sql(table_name, con=engine, if_exists='append', index=False)
+
 
 def get_postgres_engine(database_env_var: str):
     PG_HOST = os.environ.get("PG_HOST")
@@ -115,34 +108,82 @@ def upload_to_postgres(table_type, database_env_var, clear_db):
     print("CSV files have been uploaded successfully!")
 
 def merge_inferred_types(type1, type2):
+    """Merges inferred data types from different chunks into a compatible type."""
     if type1 == type2:
         return type1
-    if "string" in (type1, type2):
+
+    type_set = {type1, type2}
+
+    if "string" in type_set:
         return "string"
-    numeric_types = {"Int64", "Float64", "boolean"}
-    if type1 in numeric_types and type2 in numeric_types:
-        if "Float64" in (type1, type2):
-            return "Float64"
-        return "Int64"
-    if "datetime64[ns]" in (type1, type2):
+
+    if type_set <= {"Int64", "Float64", "boolean"}: #  set comparison to check if both types are int he numeric type
+        return "Float64" if "Float64" in type_set else "Int64"
+
+    if "datetime64[ns]" in type_set:
         return "string"
+
     return "string"
+
+def infer_numeric_type(series: pd.Series) -> str:
+    if pd.api.types.is_float_dtype(series):
+        return "Float32" if series.apply(lambda x: x is None or abs(x) < 1e38).all() else "Float64"
+    
+    if pd.api.types.is_integer_dtype(series):
+        min_val, max_val = series.min(), series.max()
+        if -128 <= min_val <= max_val <= 127:
+            return "Int8"
+        elif -32768 <= min_val <= max_val <= 32767:
+            return "Int16"
+        elif -2**31 <= min_val <= max_val <= 2**31 - 1:
+            return "Int32"
+        else:
+            return "Int64"
+    
+    return "Float64"  # fallback
+
+def infer_string_type(series: pd.Series, threshold: int = 255) -> str:
+    max_len = series.dropna().map(len).max() if not series.dropna().empty else 0
+    return f"FixedString({max_len})" if max_len <= threshold else "String"
 
 def get_final_types(csv_file_path):
     final_types = {}
     for chunk in pd.read_csv(csv_file_path, chunksize=CHUNK_SIZE_CLICKHOUSE, dtype=dict_always_str, low_memory=False):
         chunk = chunk.convert_dtypes()
         for col in chunk.columns:
-            inferred = "string" if col in dict_always_str else str(chunk[col].dtype)
+            inferred_dtype = str(chunk[col].dtype)
             is_nullable = chunk[col].isnull().any()
             if col not in final_types:
-                final_types[col] = (inferred, is_nullable)
+                final_types[col] = {
+                    "dtype": inferred_dtype,
+                    "nullable": is_nullable,
+                    "values": chunk[col]
+                }
             else:
-                prev_type, prev_nullable = final_types[col]
-                merged_type = merge_inferred_types(prev_type, inferred)
-                merged_nullable = prev_nullable or is_nullable
-                final_types[col] = (merged_type, merged_nullable)
-    return final_types
+                prev = final_types[col]
+                prev["nullable"] |= is_nullable
+                prev["values"] = pd.concat([prev["values"], chunk[col]])
+
+    inferred_types = {}
+    for col, info in final_types.items():
+        series = info["values"]
+        dtype = "string" if col in dict_always_str else str(series.infer_objects().dtype)
+
+        if pd.api.types.is_numeric_dtype(series):
+            final_type = infer_numeric_type(series)
+        elif pd.api.types.is_string_dtype(series):
+            final_type = infer_string_type(series)
+        elif pd.api.types.is_bool_dtype(series):
+            final_type = "UInt8"
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            final_type = "DateTime"
+        else:
+            final_type = "String"
+
+        inferred_types[col] = (final_type, info["nullable"])
+
+    return inferred_types
+
 
 def clear_clickhouse_database(client):
     result = client.command('SHOW TABLES')
@@ -202,10 +243,13 @@ def upload_csv_to_bigquery(client, csv_file_path, dataset_id):
     table_name = os.path.splitext(os.path.basename(csv_file_path))[0]
     table_id = f"{client.project}.{dataset_id}.{table_name}"
 
+    schema = infer_bigquery_schema(csv_file_path)
+
     job_config = bigquery.LoadJobConfig(
-        autodetect=True,
+        schema=schema,
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=1,
+        write_disposition="WRITE_TRUNCATE"
     )
 
     with open(csv_file_path, "rb") as source_file:
@@ -213,6 +257,7 @@ def upload_csv_to_bigquery(client, csv_file_path, dataset_id):
 
     job.result()
     print(f"Uploaded {csv_file_path} to {table_id}")
+
 
 
 def ensure_bigquery_dataset(client, dataset_id):
@@ -238,7 +283,6 @@ def upload_to_bigquery(table_type, dataset_env_var):
     if not dataset_id:
         raise ValueError(f"Missing environment variable: {dataset_env_var}")
     
-    # Ensure dataset exists or create it
     ensure_bigquery_dataset(client, dataset_id)
     
     tables_dict = load_tables_dict(TABLES_DICT_FILE)
@@ -250,14 +294,120 @@ def upload_to_bigquery(table_type, dataset_env_var):
         return
 
     for file_path in tqdm(csv_files, desc=f"Uploading {table_type} to BigQuery", unit="file"):
-        upload_csv_to_bigquery(client, file_path, dataset_id)
-    
+        # Step 1: Preprocess file to clean float integers
+        print(298, 'start preprocess csv for bigquery')
+        cleaned_file_path = file_path.replace(".csv", "_cleaned.csv")
+        preprocess_csv_for_bigquery(file_path, cleaned_file_path)
+        print(301, 'finish preprocess csv for bigquery')
+
+
+        # Step 2: Upload cleaned file
+        print(305, 'start upload csv for bigquery')
+        upload_csv_to_bigquery(client, cleaned_file_path, dataset_id)
+        print(307, 'finish upload csv for bigquery')
+
     print("CSV files have been uploaded to BigQuery!")
+
+
+def infer_postgres_type(series: pd.Series) -> str:
+    if pd.api.types.is_float_dtype(series):
+        return "REAL" if series.apply(lambda x: x is None or abs(x) < 1e38).all() else "DOUBLE PRECISION"
+    
+    if pd.api.types.is_integer_dtype(series):
+        min_val, max_val = series.min(), series.max()
+        if -32768 <= min_val <= max_val <= 32767:
+            return "SMALLINT"
+        elif -2**31 <= min_val <= max_val <= 2**31 - 1:
+            return "INTEGER"
+        else:
+            return "BIGINT"
+
+    if pd.api.types.is_bool_dtype(series):
+        return "BOOLEAN"
+    
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "TIMESTAMP"
+
+    if pd.api.types.is_string_dtype(series):
+        max_len = series.dropna().map(len).max() if not series.dropna().empty else 0
+        return f"VARCHAR({max_len})" if max_len <= 255 else "TEXT"
+
+    return "TEXT"
+
+def create_postgres_table(engine, file_path: str):
+    table_name = os.path.splitext(os.path.basename(file_path))[0]
+    print(f"Creating PostgreSQL table: {table_name}")
+
+    for chunk in pd.read_csv(file_path, chunksize=1, dtype=dict_always_str):
+        chunk = chunk.convert_dtypes()
+        break  # Only need first chunk to infer schema
+
+    col_defs = []
+    for col in chunk.columns:
+        series = chunk[col]
+        dtype = infer_postgres_type(series)
+        col_defs.append(f'"{col}" {dtype}')
+
+    ddl = f'CREATE TABLE IF NOT EXISTS "{table_name}" ({", ".join(col_defs)});'
+
+    with engine.connect() as conn:
+        conn.execute(text(ddl))
+
+def infer_bigquery_schema(csv_file_path: str) -> list:
+    schema = []
+    sample = pd.read_csv(csv_file_path, nrows=1000, dtype=dict_always_str)
+    sample = sample.convert_dtypes()
+
+    for col in sample.columns:
+        series = sample[col]
+
+        # Fix float strings that are actually integers
+        if pd.api.types.is_float_dtype(series) and series.dropna().apply(lambda x: float(x).is_integer()).all():
+            field_type = "INT64"
+        elif pd.api.types.is_integer_dtype(series):
+            field_type = "INT64"
+        elif pd.api.types.is_float_dtype(series):
+            field_type = "FLOAT64"
+        elif pd.api.types.is_bool_dtype(series):
+            field_type = "BOOL"
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            field_type = "DATETIME"
+        else:
+            field_type = "STRING"
+
+        schema.append(bigquery.SchemaField(col, field_type))
+
+    return schema
+
+
+def preprocess_csv_for_bigquery(input_path: str, output_path: str, chunk_size: int = 100_000):
+    first_chunk = True
+    total_lines = sum(1 for _ in open(input_path)) - 1  # Exclude header
+    num_chunks = (total_lines // chunk_size) + 1
+
+    for chunk in tqdm(pd.read_csv(input_path, dtype=dict_always_str, chunksize=chunk_size), 
+                      desc="Preprocessing CSV for BigQuery", 
+                      total=num_chunks, unit="chunk"):
+        for col in chunk.columns:
+            if pd.api.types.is_float_dtype(chunk[col]):
+                if chunk[col].dropna().apply(lambda x: float(x).is_integer()).all():
+                    chunk[col] = chunk[col].astype("Int64")  # Nullable integers
+            elif pd.api.types.is_object_dtype(chunk[col]):
+                try:
+                    converted = pd.to_numeric(chunk[col], errors='coerce')
+                    if converted.dropna().apply(lambda x: float(x).is_integer()).all():
+                        chunk[col] = converted.astype("Int64")
+                except Exception:
+                    pass
+
+        chunk.to_csv(output_path, mode='w' if first_chunk else 'a', header=first_chunk, index=False)
+        first_chunk = False
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Upload CSV files to either PostgreSQL or ClickHouse")
     parser.add_argument("--target", required=True, choices=['postgres', 'clickhouse', 'bigquery'], help="Target database to upload")    
-    parser.add_argument("--table_type", required=True, choices=['game_specific', 'player_specific', 'team_specific'], help="Type of tables to upload")
+    parser.add_argument("--table_type", required=True, choices=['game_specific', 'player_specific', 'team_specific', 'test_specific'], help="Type of tables to upload")
     parser.add_argument("--database_env_var", required=True, help="Environment variable name for the target database")
     parser.add_argument("--clear_db", action="store_true", help="Clear the target database before uploading")
     args = parser.parse_args()
