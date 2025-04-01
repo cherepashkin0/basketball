@@ -10,8 +10,9 @@ from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 
 
-CHUNK_SIZE_POSTGRES = 500000
-CHUNK_SIZE_CLICKHOUSE = 500000
+
+CHUNK_SIZE_POSTGRES = 500_000
+CHUNK_SIZE_CLICKHOUSE = 500_000
 
 CSV_DIR = "/home/wsievolod/projects/basketball/dataset/csv/"
 TABLES_DICT_FILE = "tables_dict.json"
@@ -23,7 +24,9 @@ dict_always_str = {
     'wctimestring': str,
     'wl_home': str,
     'wl_away': str,
-    'scoremargin': str
+    'scoremargin': str,
+    'fg3_pct_home': str,
+    'fg3_pct_away': str
 }
 
 def load_tables_dict(filepath: str) -> dict:
@@ -243,13 +246,21 @@ def upload_csv_to_bigquery(client, csv_file_path, dataset_id):
     table_name = os.path.splitext(os.path.basename(csv_file_path))[0]
     table_id = f"{client.project}.{dataset_id}.{table_name}"
 
+    # Delete existing table if it exists
+    if args.clear_db:
+        try:
+            client.delete_table(table_id)
+            print(f"Deleted existing table: {table_id}")
+        except NotFound:
+            print(f"Table {table_id} does not exist. Proceeding with upload.")
+
     schema = infer_bigquery_schema(csv_file_path)
 
     job_config = bigquery.LoadJobConfig(
         schema=schema,
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=1,
-        write_disposition="WRITE_TRUNCATE"
+        write_disposition="WRITE_TRUNCATE"  # Optional redundancy
     )
 
     with open(csv_file_path, "rb") as source_file:
@@ -259,10 +270,7 @@ def upload_csv_to_bigquery(client, csv_file_path, dataset_id):
     print(f"Uploaded {csv_file_path} to {table_id}")
 
 
-
 def ensure_bigquery_dataset(client, dataset_id):
-    from google.cloud.exceptions import NotFound
-
     project = client.project
     dataset_ref = bigquery.DatasetReference(project, dataset_id)
 
@@ -294,17 +302,14 @@ def upload_to_bigquery(table_type, dataset_env_var):
         return
 
     for file_path in tqdm(csv_files, desc=f"Uploading {table_type} to BigQuery", unit="file"):
+        print(297, file_path)
         # Step 1: Preprocess file to clean float integers
-        print(298, 'start preprocess csv for bigquery')
         cleaned_file_path = file_path.replace(".csv", "_cleaned.csv")
         preprocess_csv_for_bigquery(file_path, cleaned_file_path)
-        print(301, 'finish preprocess csv for bigquery')
 
 
         # Step 2: Upload cleaned file
-        print(305, 'start upload csv for bigquery')
         upload_csv_to_bigquery(client, cleaned_file_path, dataset_id)
-        print(307, 'finish upload csv for bigquery')
 
     print("CSV files have been uploaded to BigQuery!")
 
@@ -359,21 +364,21 @@ def infer_bigquery_schema(csv_file_path: str) -> list:
     sample = sample.convert_dtypes()
 
     for col in sample.columns:
-        series = sample[col]
-
-        # Fix float strings that are actually integers
-        if pd.api.types.is_float_dtype(series) and series.dropna().apply(lambda x: float(x).is_integer()).all():
-            field_type = "INT64"
-        elif pd.api.types.is_integer_dtype(series):
-            field_type = "INT64"
-        elif pd.api.types.is_float_dtype(series):
-            field_type = "FLOAT64"
-        elif pd.api.types.is_bool_dtype(series):
-            field_type = "BOOL"
-        elif pd.api.types.is_datetime64_any_dtype(series):
-            field_type = "DATETIME"
-        else:
+        # Use STRING if the column is explicitly forced to string
+        if col in dict_always_str:
             field_type = "STRING"
+        else:
+            series = sample[col]
+            if pd.api.types.is_integer_dtype(series):
+                field_type = "INT64"
+            elif pd.api.types.is_float_dtype(series):
+                field_type = "FLOAT64"
+            elif pd.api.types.is_bool_dtype(series):
+                field_type = "BOOL"
+            elif pd.api.types.is_datetime64_any_dtype(series):
+                field_type = "DATETIME"
+            else:
+                field_type = "STRING"
 
         schema.append(bigquery.SchemaField(col, field_type))
 
@@ -385,10 +390,12 @@ def preprocess_csv_for_bigquery(input_path: str, output_path: str, chunk_size: i
     total_lines = sum(1 for _ in open(input_path)) - 1  # Exclude header
     num_chunks = (total_lines // chunk_size) + 1
 
-    for chunk in tqdm(pd.read_csv(input_path, dtype=dict_always_str, chunksize=chunk_size), 
-                      desc="Preprocessing CSV for BigQuery", 
-                      total=num_chunks, unit="chunk"):
+    for chunk in pd.read_csv(input_path, dtype=dict_always_str, chunksize=chunk_size): 
+    # tqdm(pd.read_csv(input_path, dtype=dict_always_str, chunksize=chunk_size), desc="Preprocessing CSV for BigQuery", total=num_chunks, unit="chunk"):
         for col in chunk.columns:
+            if col in dict_always_str:
+                continue  # Force to string, skip type conversion
+
             if pd.api.types.is_float_dtype(chunk[col]):
                 if chunk[col].dropna().apply(lambda x: float(x).is_integer()).all():
                     chunk[col] = chunk[col].astype("Int64")  # Nullable integers
