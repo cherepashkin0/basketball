@@ -127,7 +127,7 @@ def main(table_type: str, database_env_var: str, clear_db: bool):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Upload CSV files to ClickHouse")
-    parser.add_argument("--table_type", required=True, choices=['game_specific', 'player_specific'], help="Type of tables to upload")
+    parser.add_argument("--table_type", required=True, choices=['game_specific', 'player_specific', 'team_specific'], help="Type of tables to upload")
     parser.add_argument("--database_env_var", required=True, help="Environment variable name for the target database")
     parser.add_argument("--clear_db", action="store_true", help="Clear database before uploading")
     args = parser.parse_args()
