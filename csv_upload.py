@@ -8,10 +8,12 @@ from sqlalchemy import create_engine, inspect, text
 from clickhouse_connect import get_client
 from google.cloud import bigquery 
 from google.cloud.exceptions import NotFound
+import io
+import csv
 
 
-CHUNK_SIZE_POSTGRES = 500_000
-CHUNK_SIZE_CLICKHOUSE = 500_000
+CHUNK_SIZE_POSTGRES = 1_000_000
+CHUNK_SIZE_CLICKHOUSE = 1_000_000
 
 CSV_DIR = "/home/wsievolod/projects/basketball/dataset/csv/"
 TABLES_DICT_FILE = "tables_dict.json"
@@ -55,12 +57,13 @@ def find_csv_files(directory: str, table_names: set) -> list:
     all_csv_files = glob.glob(os.path.join(directory, "*.csv"))
     return [f for f in all_csv_files if os.path.splitext(os.path.basename(f))[0] in table_names]
 
+
 def upload_csv_to_postgres(engine, file_path: str):
     table_name = os.path.splitext(os.path.basename(file_path))[0]
     create_postgres_table(engine, file_path)
     chunk_iterator = pd.read_csv(file_path, chunksize=CHUNK_SIZE_POSTGRES)
     for chunk in tqdm(chunk_iterator, desc=f"Uploading {table_name}", unit="chunk"):
-        chunk.to_sql(table_name, con=engine, if_exists='append', index=False)
+        chunk.to_sql(table_name, engine, if_exists='append', index=False, method=psql_insert_copy)
 
 
 def get_postgres_engine(database_env_var: str):
@@ -334,10 +337,18 @@ def upload_to_bigquery(table_type, dataset_env_var):
 
 def infer_postgres_type(series: pd.Series) -> str:
     if pd.api.types.is_float_dtype(series):
-        return "REAL" if series.apply(lambda x: x is None or abs(x) < 1e38).all() else "DOUBLE PRECISION"
+        return "REAL" if series.dropna().apply(lambda x: abs(x) < 1e38).all() else "DOUBLE PRECISION"
     
     if pd.api.types.is_integer_dtype(series):
-        min_val, max_val = series.min(), series.max()
+        numeric_series = series.dropna()
+        if numeric_series.empty:
+            return "INTEGER"  # Default fallback for empty integer series
+
+        min_val, max_val = numeric_series.min(), numeric_series.max()
+
+        if pd.isna(min_val) or pd.isna(max_val):
+            return "INTEGER"  # Default fallback if min/max is NA
+
         if -32768 <= min_val <= max_val <= 32767:
             return "SMALLINT"
         elif -2**31 <= min_val <= max_val <= 2**31 - 1:
@@ -352,24 +363,77 @@ def infer_postgres_type(series: pd.Series) -> str:
         return "TIMESTAMP"
 
     if pd.api.types.is_string_dtype(series):
-        max_len = series.dropna().map(len).max() if not series.dropna().empty else 0
+        max_len = series.dropna().map(len).max() if not series.dropna().empty else 10
+        if max_len == 0:
+            max_len = 10  # Avoid VARCHAR(0)
         return f"VARCHAR({max_len})" if max_len <= 255 else "TEXT"
 
     return "TEXT"
+
+
+def infer_schema_from_multiple_chunks(file_path: str, dtype_dict: dict, sample_chunks: int = 5):
+    final_schema = {}
+
+    chunk_iterator = pd.read_csv(file_path, chunksize=10000, dtype=dtype_dict)
+    chunks_read = 0
+
+    for chunk in chunk_iterator:
+        chunk = chunk.convert_dtypes()
+        for col in chunk.columns:
+            series = chunk[col]
+
+            current_type = infer_postgres_type(series)
+
+            # Merge inferred types safely
+            if col not in final_schema:
+                final_schema[col] = current_type
+            else:
+                final_schema[col] = merge_postgres_types(final_schema[col], current_type)
+
+        chunks_read += 1
+        if chunks_read >= sample_chunks:
+            break  # Limit to first few chunks to avoid long runtime
+
+    return final_schema
+
+def merge_postgres_types(type1, type2):
+    priority = {
+        "TEXT": 5,
+        "VARCHAR": 4,
+        "DOUBLE PRECISION": 3,
+        "REAL": 2,
+        "BIGINT": 1,
+        "INTEGER": 0,
+        "SMALLINT": -1,
+        "BOOLEAN": -2,
+        "TIMESTAMP": -3
+    }
+
+    # Simple logic: higher priority type overrides lower priority type
+    type1_base = "VARCHAR" if type1.startswith("VARCHAR") else type1
+    type2_base = "VARCHAR" if type2.startswith("VARCHAR") else type2
+
+    chosen_type = type1 if priority[type1_base] >= priority[type2_base] else type2
+
+    # For VARCHAR, take the largest length seen
+    if "VARCHAR" in [type1_base, type2_base]:
+        len1 = int(type1[type1.find("(")+1:type1.find(")")]) if "VARCHAR" in type1 else 0
+        len2 = int(type2[type2.find("(")+1:type2.find(")")]) if "VARCHAR" in type2 else 0
+        chosen_type = f"VARCHAR({max(len1, len2, 10)})"  # minimum 10 to avoid VARCHAR(0)
+
+        if max(len1, len2) > 255:
+            chosen_type = "TEXT"
+
+    return chosen_type
+
 
 def create_postgres_table(engine, file_path: str):
     table_name = os.path.splitext(os.path.basename(file_path))[0]
     print(f"Creating PostgreSQL table: {table_name}")
 
-    for chunk in pd.read_csv(file_path, chunksize=1, dtype=dict_always_str):
-        chunk = chunk.convert_dtypes()
-        break  # Only need first chunk to infer schema
+    schema = infer_schema_from_multiple_chunks(file_path, dict_always_str)
 
-    col_defs = []
-    for col in chunk.columns:
-        series = chunk[col]
-        dtype = infer_postgres_type(series)
-        col_defs.append(f'"{col}" {dtype}')
+    col_defs = [f'"{col}" {dtype}' for col, dtype in schema.items()]
 
     ddl = f'CREATE TABLE IF NOT EXISTS "{table_name}" ({", ".join(col_defs)});'
 
@@ -379,6 +443,7 @@ def create_postgres_table(engine, file_path: str):
 
 def infer_bigquery_schema(csv_file_path: str) -> list:
     schema = []
+    # todo: change nrows=1000 to chunks. in case first nrows may be NaN or have different value (float instead of integer)
     sample = pd.read_csv(csv_file_path, nrows=1000, dtype=dict_always_str)
     sample = sample.convert_dtypes()
 
@@ -428,6 +493,19 @@ def preprocess_csv_for_bigquery(input_path: str, output_path: str, chunk_size: i
 
         chunk.to_csv(output_path, mode='w' if first_chunk else 'a', header=first_chunk, index=False)
         first_chunk = False
+
+
+def psql_insert_copy(table, conn, keys, data_iter):
+    with conn.connection.cursor() as cursor:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerows(data_iter)
+        buffer.seek(0)
+
+        columns = ', '.join(f'"{k}"' for k in keys)
+        table_name = table.name if hasattr(table, 'name') else table
+        sql = f'COPY "{table_name}" ({columns}) FROM STDIN WITH CSV'
+        cursor.copy_expert(sql=sql, file=buffer)
 
 
 if __name__ == "__main__":
