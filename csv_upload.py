@@ -10,7 +10,6 @@ from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 
 
-
 CHUNK_SIZE_POSTGRES = 500_000
 CHUNK_SIZE_CLICKHOUSE = 500_000
 
@@ -28,6 +27,25 @@ dict_always_str = {
     'fg3_pct_home': str,
     'fg3_pct_away': str
 }
+
+type_mapping = {
+    "Int8": "Int8",
+    "Int16": "Int16",
+    "Int32": "Int32",
+    "Int64": "Int64",
+    "UInt8": "UInt8",
+    "UInt16": "UInt16",
+    "UInt32": "UInt32",
+    "UInt64": "UInt64",
+    "Float32": "Float32",
+    "Float64": "Float64",
+    "string": "String",
+    "String": "String",
+    "FixedString(255)": "FixedString(255)",
+    "DateTime": "DateTime",
+    "boolean": "UInt8",  # In ClickHouse, booleans are typically stored as UInt8
+}
+
 
 def load_tables_dict(filepath: str) -> dict:
     with open(filepath, 'r') as file:
@@ -170,7 +188,7 @@ def get_final_types(csv_file_path):
     inferred_types = {}
     for col, info in final_types.items():
         series = info["values"]
-        dtype = "string" if col in dict_always_str else str(series.infer_objects().dtype)
+        # dtype = "string" if col in dict_always_str else str(series.infer_objects().dtype)
 
         if pd.api.types.is_numeric_dtype(series):
             final_type = infer_numeric_type(series)
@@ -358,6 +376,7 @@ def create_postgres_table(engine, file_path: str):
     with engine.connect() as conn:
         conn.execute(text(ddl))
 
+
 def infer_bigquery_schema(csv_file_path: str) -> list:
     schema = []
     sample = pd.read_csv(csv_file_path, nrows=1000, dtype=dict_always_str)
@@ -387,8 +406,8 @@ def infer_bigquery_schema(csv_file_path: str) -> list:
 
 def preprocess_csv_for_bigquery(input_path: str, output_path: str, chunk_size: int = 100_000):
     first_chunk = True
-    total_lines = sum(1 for _ in open(input_path)) - 1  # Exclude header
-    num_chunks = (total_lines // chunk_size) + 1
+    # total_lines = sum(1 for _ in open(input_path)) - 1  # Exclude header
+    # num_chunks = (total_lines // chunk_size) + 1
 
     for chunk in pd.read_csv(input_path, dtype=dict_always_str, chunksize=chunk_size): 
     # tqdm(pd.read_csv(input_path, dtype=dict_always_str, chunksize=chunk_size), desc="Preprocessing CSV for BigQuery", total=num_chunks, unit="chunk"):
