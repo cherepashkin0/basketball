@@ -6,3 +6,10 @@ google-cloud-bigquery
 clickhouse-driver[lz4]
 google-cloud-storage
 pyarrow 
+phik
+seaborn
+polars
+pyan3
+scikit-learn
+clickhouse-connect
+pandas-gbq>=0.26.1

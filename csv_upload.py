@@ -508,7 +508,7 @@ def psql_insert_copy(table, conn, keys, data_iter):
         cursor.copy_expert(sql=sql, file=buffer)
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Upload CSV files to either PostgreSQL or ClickHouse")
     parser.add_argument("--target", required=True, choices=['postgres', 'clickhouse', 'bigquery'], help="Target database to upload")    
     parser.add_argument("--table_type", required=True, choices=['game_specific', 'player_specific', 'team_specific', 'test_specific'], help="Type of tables to upload")
@@ -522,3 +522,6 @@ if __name__ == "__main__":
         upload_to_clickhouse(args.table_type, args.database_env_var, args.clear_db)
     elif args.target == "bigquery":
         upload_to_bigquery(args.table_type, args.database_env_var)
+
+if __name__ == "__main__":
+    main()

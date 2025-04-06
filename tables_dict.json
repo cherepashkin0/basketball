@@ -1,4 +1,7 @@
 {
+    "test_specific": [
+        "game"
+    ],
     "game_specific": [
         "game",
         "game_info",
@@ -13,7 +16,9 @@
         "common_player_info",
         "draft_combine_stats",
         "draft_history",
-        "player",
+        "player"
+    ],
+    "team_specific": [
         "team",
         "team_details",
         "team_history",
