@@ -11,6 +11,7 @@ from google.cloud.bigquery_storage_v1 import BigQueryReadClient
 from google.cloud.bigquery_storage_v1 import types
 import io
 from io import StringIO
+import numpy as np
 
 
 def get_pg_connection(db_name):
@@ -208,7 +209,7 @@ def migrate_bigquery_to_clickhouse(db_name, chunk_size=50_000):
             rows_iterable = bq_client.list_rows(bq_table)
             total_rows = 0
 
-            for chunk in rows_iterable.to_dataframe_iterable(bqstorage_client=bq_storage_client, max_results=chunk_size):
+            for chunk in rows_iterable.to_dataframe_iterable(bqstorage_client=bq_storage_client):
                 chunk = chunk.where(pd.notnull(chunk), None)
                 if not chunk.empty:
                     ch_client.insert(f"{db_name}.{table_name}", chunk)
@@ -242,30 +243,31 @@ def migrate_bigquery_to_postgresql(db_name, chunk_size=50_000):
         total_rows = 0
 
         try:
-            print(f"📥 Downloading {table_name} from BigQuery in chunks of {chunk_size} rows...")
+            print(f"📥 Downloading {table_name} from BigQuery...")
 
-            # First chunk needs to REPLACE the table (create it), the rest APPEND
+            # Lade gesamten DataFrame
+            df = bq_client.list_rows(full_table_id).to_dataframe(bqstorage_client=bq_storage_client)
+
+            if df.empty:
+                print(f"⚠️ Skipping empty table: {table_name}")
+                continue
+
+            # Teile in Chunks auf
+            chunks = np.array_split(df, int(len(df) / chunk_size) + 1)
+
             first_chunk = True
-
-            for chunk in bq_client.list_rows(full_table_id).to_dataframe_iterable(
-                bqstorage_client=bq_storage_client, max_results=chunk_size
-            ):
+            for chunk in chunks:
                 if chunk.empty:
                     continue
 
                 chunk = chunk.where(pd.notnull(chunk), None)
-
                 if_exists = "replace" if first_chunk else "append"
-                chunk.head(0).to_sql(table, pg_engine, index=False, if_exists='replace')
+                chunk.head(0).to_sql(table_name, pg_engine, index=False, if_exists=if_exists)
                 copy_from_stringio(chunk, table_name, pg_engine)
-                # chunk.to_sql(table_name, con=pg_engine, index=False, if_exists=if_exists)
                 total_rows += len(chunk)
                 first_chunk = False
 
-            if total_rows == 0:
-                print(f"⚠️ Skipping empty table: {table_name}")
-            else:
-                print(f"✅ Inserted {total_rows} rows into PostgreSQL table: {table_name}")
+            print(f"✅ Inserted {total_rows} rows into PostgreSQL table: {table_name}")
 
         except Exception as e:
             print(f"❌ Failed to migrate {table_name}: {e}")
@@ -400,12 +402,21 @@ def drop_postgres_database_if_exists(db_name):
     )
     admin_conn.autocommit = True
     admin_cursor = admin_conn.cursor()
+
     admin_cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
     if admin_cursor.fetchone():
+        print(f"🛑 Terminating connections to PostgreSQL database: {db_name}")
+        admin_cursor.execute(f"""
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = %s AND pid <> pg_backend_pid()
+        """, (db_name,))
         print(f"🗑️ Dropping PostgreSQL database: {db_name}")
         admin_cursor.execute(f'DROP DATABASE "{db_name}"')
+
     admin_cursor.close()
     admin_conn.close()
+
 
 
 def drop_clickhouse_database_if_exists(db_name):
