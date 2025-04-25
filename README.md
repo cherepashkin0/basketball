@@ -2,7 +2,7 @@
 
 A pet project focused on loading, merging, and auto-detecting data types from the [Kaggle NBA dataset](https://www.kaggle.com/datasets/wyattowalsh/basketball). 
 
-This dataset is updated daily and includes:
+The dataset includes:
 - 30 teams
 - 4800+ players
 - 65,000+ games (every game since the inaugural 1946-47 NBA season)
