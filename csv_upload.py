@@ -170,7 +170,9 @@ def infer_string_type(series: pd.Series, threshold: int = 255) -> str:
     max_len = series.dropna().map(len).max() if not series.dropna().empty else 0
     return f"FixedString({max_len})" if max_len <= threshold else "String"
 
+
 def get_final_types(csv_file_path):
+    # Read the CSV file in chunks and infer types
     final_types = {}
     for chunk in pd.read_csv(csv_file_path, chunksize=CHUNK_SIZE_CLICKHOUSE, dtype=dict_always_str, low_memory=False):
         chunk = chunk.convert_dtypes()
@@ -263,12 +265,11 @@ def upload_to_clickhouse(table_type, database_env_var, clear_db):
 def get_bigquery_client():
     return bigquery.Client()
 
-def upload_csv_to_bigquery(client, csv_file_path, dataset_id):
+def upload_csv_to_bigquery_stream(client, csv_file_path, dataset_id, clear_db=False):
     table_name = os.path.splitext(os.path.basename(csv_file_path))[0]
     table_id = f"{client.project}.{dataset_id}.{table_name}"
 
-    # Delete existing table if it exists
-    if args.clear_db:
+    if clear_db:
         try:
             client.delete_table(table_id)
             print(f"Deleted existing table: {table_id}")
@@ -281,19 +282,31 @@ def upload_csv_to_bigquery(client, csv_file_path, dataset_id):
         schema=schema,
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=1,
-        write_disposition="WRITE_TRUNCATE"  # Optional redundancy
+        write_disposition="WRITE_TRUNCATE"
     )
 
-    with open(csv_file_path, "rb") as source_file:
-        job = client.load_table_from_file(source_file, table_id, job_config=job_config)
+    # Upload the entire CSV in-memory stream in chunks
+    full_stream = io.StringIO()
+    for buffer in preprocess_csv_for_bigquery_stream(csv_file_path):
+        full_stream.write(buffer.read())
+    full_stream.seek(0)
 
-    job.result()
+    load_job = client.load_table_from_file(full_stream, table_id, job_config=job_config)
+    load_job.result()
     print(f"Uploaded {csv_file_path} to {table_id}")
 
 
-def ensure_bigquery_dataset(client, dataset_id):
+
+def ensure_bigquery_dataset(client, dataset_id, clear_db=False):
     project = client.project
     dataset_ref = bigquery.DatasetReference(project, dataset_id)
+
+    if clear_db:
+        try:
+            client.delete_dataset(dataset_ref, delete_contents=True, not_found_ok=True)
+            print(f"Deleted existing dataset: {dataset_id}")
+        except Exception as e:
+            print(f"Error deleting dataset {dataset_id}: {e}")
 
     try:
         client.get_dataset(dataset_ref)
@@ -305,15 +318,16 @@ def ensure_bigquery_dataset(client, dataset_id):
         print(f"Created BigQuery dataset: {dataset_id}")
 
 
-def upload_to_bigquery(table_type, dataset_env_var):
+
+def upload_to_bigquery(table_type, dataset_env_var, clear_db):
     client = get_bigquery_client()
     dataset_id = os.getenv(dataset_env_var)
-    
+
     if not dataset_id:
         raise ValueError(f"Missing environment variable: {dataset_env_var}")
-    
-    ensure_bigquery_dataset(client, dataset_id)
-    
+
+    ensure_bigquery_dataset(client, dataset_id, clear_db=clear_db)
+
     tables_dict = load_tables_dict(TABLES_DICT_FILE)
     selected_table_names = set(tables_dict[table_type])
     csv_files = find_csv_files(CSV_DIR, selected_table_names)
@@ -323,16 +337,10 @@ def upload_to_bigquery(table_type, dataset_env_var):
         return
 
     for file_path in tqdm(csv_files, desc=f"Uploading {table_type} to BigQuery", unit="file"):
-        print(297, file_path)
-        # Step 1: Preprocess file to clean float integers
-        cleaned_file_path = file_path.replace(".csv", "_cleaned.csv")
-        preprocess_csv_for_bigquery(file_path, cleaned_file_path)
-
-
-        # Step 2: Upload cleaned file
-        upload_csv_to_bigquery(client, cleaned_file_path, dataset_id)
+        upload_csv_to_bigquery_stream(client, file_path, dataset_id, clear_db=clear_db)
 
     print("CSV files have been uploaded to BigQuery!")
+
 
 
 def infer_postgres_type(series: pd.Series) -> str:
@@ -469,20 +477,15 @@ def infer_bigquery_schema(csv_file_path: str) -> list:
     return schema
 
 
-def preprocess_csv_for_bigquery(input_path: str, output_path: str, chunk_size: int = 100_000):
+def preprocess_csv_for_bigquery_stream(input_path: str, chunk_size: int = 100_000):
     first_chunk = True
-    # total_lines = sum(1 for _ in open(input_path)) - 1  # Exclude header
-    # num_chunks = (total_lines // chunk_size) + 1
-
-    for chunk in pd.read_csv(input_path, dtype=dict_always_str, chunksize=chunk_size): 
-    # tqdm(pd.read_csv(input_path, dtype=dict_always_str, chunksize=chunk_size), desc="Preprocessing CSV for BigQuery", total=num_chunks, unit="chunk"):
+    for chunk in pd.read_csv(input_path, dtype=dict_always_str, chunksize=chunk_size):
         for col in chunk.columns:
             if col in dict_always_str:
-                continue  # Force to string, skip type conversion
-
+                continue
             if pd.api.types.is_float_dtype(chunk[col]):
                 if chunk[col].dropna().apply(lambda x: float(x).is_integer()).all():
-                    chunk[col] = chunk[col].astype("Int64")  # Nullable integers
+                    chunk[col] = chunk[col].astype("Int64")
             elif pd.api.types.is_object_dtype(chunk[col]):
                 try:
                     converted = pd.to_numeric(chunk[col], errors='coerce')
@@ -491,7 +494,10 @@ def preprocess_csv_for_bigquery(input_path: str, output_path: str, chunk_size: i
                 except Exception:
                     pass
 
-        chunk.to_csv(output_path, mode='w' if first_chunk else 'a', header=first_chunk, index=False)
+        buffer = io.StringIO()
+        chunk.to_csv(buffer, header=first_chunk, index=False)
+        buffer.seek(0)
+        yield buffer
         first_chunk = False
 
 
@@ -516,12 +522,14 @@ def main():
     parser.add_argument("--clear_db", action="store_true", help="Clear the target database before uploading")
     args = parser.parse_args()
 
+    clear_db = args.clear_db
+
     if args.target == "postgres":
-        upload_to_postgres(args.table_type, args.database_env_var, args.clear_db)
+        upload_to_postgres(args.table_type, args.database_env_var, clear_db)
     elif args.target == "clickhouse":
-        upload_to_clickhouse(args.table_type, args.database_env_var, args.clear_db)
+        upload_to_clickhouse(args.table_type, args.database_env_var, clear_db)
     elif args.target == "bigquery":
-        upload_to_bigquery(args.table_type, args.database_env_var)
+        upload_to_bigquery(args.table_type, args.database_env_var, clear_db)
 
 if __name__ == "__main__":
     main()

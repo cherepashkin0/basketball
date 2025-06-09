@@ -13,3 +13,6 @@ pyan3
 scikit-learn
 clickhouse-connect
 pandas-gbq>=0.26.1
+google-cloud-bigquery-storage
+numpy
+pysqlite3-binary

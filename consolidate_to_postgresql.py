@@ -117,8 +117,7 @@ def migrate_clickhouse_to_postgresql(db_name, source_db):
     for (table,) in tables:
         try:
             print(f"📥 Reading from ClickHouse: {source_db}.{table}")
-            result = ch_client.query(f"SELECT * FROM {source_db}.{table}")
-            df = pd.DataFrame(result.result_rows, columns=result.column_names)
+            df = ch_client.query_df(f"SELECT * FROM {source_db}.{table}")
 
             if df.empty:
                 print(f"⚠️ Skipping empty table: {table}")
